@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Flight Radar System</title>
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster/dist/MarkerCluster.css"/>
+<script src="https://unpkg.com/leaflet.markercluster/dist/leaflet.markercluster.js"></script>
+
+<style>
+body { margin:0; }
+#map { height:100vh; }
+</style>
+</head>
+
+<body>
+<div id="map"></div>
+
+<script>
+
+// 🌍 MAP
+const map = L.map('map').setView([20.5937, 78.9629], 5);
+
+// 🌍 Free map (OpenStreetMap)
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 18,
+}).addTo(map);
+
+// ✈️ Layer for planes
+let planesLayer = L.layerGroup().addTo(map);
+
+
+// ---------------- FLIGHTS ----------------
+let LIVE_FLIGHTS = [];
+let flightLayer = L.layerGroup().addTo(map);
+
+async function loadFlights() {
+  const res = await fetch("http://localhost:3000/flights");
+  const data = await res.json();
+
+  console.log("FULL DATA:", data);
+  console.log("STATES:", data.states);
+
+  LIVE_FLIGHTS = (data.states || []).map(f => ({
+    callsign: f[1]?.trim(),
+    lat: f[6],
+    lon: f[5],
+    alt: f[7],
+    speed: f[9]
+  }));
+
+  console.log("Processed flights:", LIVE_FLIGHTS);
+}
+
+loadFlights();
+setInterval(loadFlights, 15000);
+
+async function loadLivePlanes() {
+  const url = "https://opensky-network.org/api/states/all";
+
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("API failed");
+
+    const data = await res.json();
+
+    planesLayer.clearLayers();
+
+    if (!data.states) return;
+
+    data.states.slice(0, 50).forEach(p => {
+      const lat = p[6];
+      const lon = p[5];
+
+      if (!lat || !lon) return;
+
+      L.circleMarker([lat, lon], {
+        radius: 3,
+        color: "cyan"
+      }).addTo(planesLayer);
+    });
+  } catch (err) {
+    console.error('Plane error:', err);
+  }
+}
+
+// refresh every 15 sec (safe)
+setInterval(loadLivePlanes, 15000);
+loadLivePlanes();
+
+// ---------------- SCHEDULED FLIGHTS (AviationStack) ----------------
+let SCHEDULED_FLIGHTS = [];
+
+async function loadSchedules() {
+  try {
+    const API_KEY = "4d2094167abe105a05b8825df22696ec"; // replace with your aviationstack key or proxy endpoint
+
+    const res = await fetch(
+      `https://api.aviationstack.com/v1/flights?access_key=${API_KEY}&limit=100`
+    );
+
+    const data = await res.json();
+
+    SCHEDULED_FLIGHTS = data.data || [];
+
+    console.log("Schedules:", SCHEDULED_FLIGHTS.length);
+  } catch (err) {
+    console.warn('Schedules load error', err);
+  }
+}
+
+loadSchedules();
+setInterval(loadSchedules, 60000);
+
+// global matcher: match live callsign to scheduled flight
+function findFlightDetails(callsign) {
+  return SCHEDULED_FLIGHTS.find(f =>
+    f.flight?.iata &&
+    callsign &&
+    callsign.includes(f.flight.iata.replace(/\s/g, ""))
+  );
+}
+
+// 🌐 GLOBAL FLIGHT STORAGE (single fetch, reuse for all queries)
+let globalFlights = [];
+let lastUpdate = 0;
+
+// quick lookup map for airports by IATA
+const airportsMap = {};
+
+// 📡 Load all flights ONCE at startup (no repeated API calls)
+async function loadFlightsOnce() {
+
+  try {
+    const res = await fetch("https://opensky-network.org/api/states/all");
+    const data = await res.json();
+
+    globalFlights = data.states || [];
+    lastUpdate = Date.now();
+
+    console.log("Flights loaded:", globalFlights.length);
+
+  } catch (err) {
+    console.log("API blocked");
+  }
+
+}
+
+// ⚡ Query local flight data (instant, no API call)
+function getFlights(iata) {
+
+  let html = `<b>✈️ ${iata} Airport</b><br><br>`;
+
+  const airport = airportsMap[iata];
+
+  if (!airport) return html + "No airport data";
+
+  let flights = [];
+
+  globalFlights.forEach(f => {
+
+    const callsign = f[1]?.trim();
+    const lon = f[5];
+    const lat = f[6];
+
+    if (!callsign || !lat || !lon) return;
+
+    const distance = Math.sqrt(
+      Math.pow(lat - airport.lat, 2) +
+      Math.pow(lon - airport.lon, 2)
+    );
+
+    if (distance < 5) {
+      flights.push(callsign);
+    }
+
+  });
+
+  html += `<b>🛰️ Live Flights (${flights.length})</b><br>`;
+
+  if (flights.length > 0) {
+    flights.slice(0, 5).forEach(f => {
+      html += `✈️ ${f}<br>`;
+    });
+  } else {
+    html += `No flights nearby`;
+  }
+
+  return html;
+}
+
+// ---------------- AIRPORTS ----------------
+
+let airportCluster = L.markerClusterGroup();
+map.addLayer(airportCluster);
+
+// Show departures board popup for an airport
+function showAirportBoard(flights, lat, lon, iata) {
+
+  let html = `
+    <h3>✈️ ${iata} Departures</h3>
+    <table style="width:100%; font-size:12px; border-collapse: collapse;">
+      <tr>
+        <th>Flight</th>
+        <th>Airline</th>
+        <th>To</th>
+        <th>Time</th>
+        <th>Status</th>
+      </tr>
+  `;
+
+  flights.forEach(f => {
+    html += `
+      <tr>
+        <td>${f.flight?.iata || "-"}</td>
+        <td>${f.airline?.name || "-"}</td>
+        <td>${f.arrival?.iata || "-"}</td>
+        <td>${f.departure?.scheduled?.slice(11,16) || "-"}</td>
+        <td>${f.flight_status}</td>
+      </tr>
+    `;
+  });
+
+  html += `</table>`;
+
+  L.popup()
+    .setLatLng([lat, lon])
+    .setContent(html)
+    .openOn(map);
+}
+
+// Map flight_status to readable icon/label
+function getFlightStatus(f) {
+  if (f.flight_status === "active") return "✈️ Flying";
+  if (f.flight_status === "landed") return "🛬 Landed";
+  if (f.flight_status === "scheduled") return "🕒 Scheduled";
+  return "🟡 Unknown";
+}
+
+// Full airport dashboard (departures + arrivals)
+function showFullAirportBoard(iata, lat, lon, departures, arrivals) {
+
+  let html = `
+    <h2>🛫 ${iata} Airport</h2>
+
+    <b>Departures (${departures.length})</b>
+    <table style="width:100%; font-size:12px">
+      <tr>
+        <th>Flight</th>
+        <th>To</th>
+        <th>Status</th>
+      </tr>
+  `;
+
+  departures.slice(0,5).forEach(f => {
+    html += `
+      <tr>
+        <td>${f.flight?.iata || "-"}</td>
+        <td>${f.arrival?.iata || "-"}</td>
+        <td>${getFlightStatus(f)}</td>
+      </tr>
+    `;
+  });
+
+  html += `</table><br>`;
+
+  html += `
+    <b>Arrivals (${arrivals.length})</b>
+    <table style="width:100%; font-size:12px">
+      <tr>
+        <th>Flight</th>
+        <th>From</th>
+        <th>Status</th>
+      </tr>
+  `;
+
+  arrivals.slice(0,5).forEach(f => {
+    html += `
+      <tr>
+        <td>${f.flight?.iata || "-"}</td>
+        <td>${f.departure?.iata || "-"}</td>
+        <td>${getFlightStatus(f)}</td>
+      </tr>
+    `;
+  });
+
+  html += `</table>`;
+
+  // ❗ fallback if nothing
+  if (departures.length === 0 && arrivals.length === 0) {
+    html += `<br><i>No live flights (free API limitation)</i>`;
+  }
+
+  L.popup()
+    .setLatLng([lat, lon])
+    .setContent(html)
+    .openOn(map);
+}
+
+// Haversine distance (km)
+function haversine(lat1, lon1, lat2, lon2) {
+  const toRad = v => v * Math.PI / 180;
+  const R = 6371; // km
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+            Math.sin(dLon/2) * Math.sin(dLon/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R * c;
+}
+
+// AIRPORT TIMETABLE (REAL DATA)
+async function loadAirportFlights(iata, lat, lon) {
+
+const API_KEY = "4d2094167abe105a05b8825df22696ec";   // 🔴 put here
+
+  try {
+    const depUrl = `https://api.aviationstack.com/v1/flights?access_key=${API_KEY}&dep_iata=${iata}`;
+    const res = await fetch(depUrl);
+
+    if (!res.ok) throw new Error('API failed');
+
+    const data = await res.json();
+
+    let html = `<h3>${iata} Airport</h3>`;
+
+    if (!data.data || data.data.length === 0) {
+      html += "No flights found (API limit)";
+    } else {
+
+      data.data.slice(0, 5).forEach(f => {
+        html += `
+          <b>${f.airline?.name || "-"}</b><br>
+          Flight: ${f.flight?.iata || "-"}<br>
+          From: ${f.departure?.iata || "-"}<br>
+          To: ${f.arrival?.iata || "-"}<br>
+          Time: ${f.departure?.scheduled?.slice(0,16) || "-"}<br>
+          Status: ${f.flight_status || "-"}<br>
+          <hr>
+        `;
+      });
+
+    }
+
+    L.popup()
+      .setLatLng([lat, lon])
+      .setContent(html)
+      .openOn(map);
+
+  } catch (err) {
+    console.error("Flight error:", err);
+    showPopup(lat, lon, 'Error loading flights');
+  }
+}
+
+
+
+
+// 🌍 Check if airport is in African continent
+async function loadAirports() {
+  const res = await fetch("https://raw.githubusercontent.com/mwgg/Airports/master/airports.json");
+  const data = await res.json();
+
+  // Add every airport worldwide (use clustering to keep map responsive)
+  Object.values(data).forEach(a => {
+
+    const lat = a.lat;
+    const lon = a.lon;
+    const iata = a.iata;
+    const icao = a.icao;
+    const name = a.name;
+
+    if (!lat || !lon) return;
+
+    // create a stable key: prefer IATA, then ICAO, then name
+    const code = iata || icao || name || `${lat}_${lon}`;
+
+    // save for later use (store metadata)
+    airportsMap[code] = { lat, lon, iata, icao, name };
+
+    const display = name ? `${code} — ${name}` : code;
+
+    const marker = L.marker([lat, lon]);
+
+    marker.bindTooltip(`✈️ ${display}`);
+
+    marker.on("click", () => {
+
+      const html = getFlights(code);
+      marker.bindPopup(html).openPopup();
+
+    });
+
+    airportCluster.addLayer(marker);
+
+  });
+
+}
+
+loadAirports();
+
+// 📡 Load flights ONCE at startup
+loadFlightsOnce();
+setInterval(loadFlightsOnce, 60000);
+
+</script>
+</body>
+</html>
