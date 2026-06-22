@@ -1,0 +1,28 @@
+body {
+  margin: 0;
+  background: #000;
+  color: #00ffe1;
+  font-family: Arial;
+  text-align: center;
+}
+
+h1 {
+  margin: 10px;
+  text-shadow: 0 0 10px #00ffe1;
+}
+
+#map {
+  height: 90vh;
+  width: 100%;
+  filter: brightness(0.8) contrast(1.2);
+}
+
+/* glowing popup */
+.leaflet-popup-content-wrapper {
+  background: #111;
+  color: #00ffe1;
+}
+
+.ceiling {
+  transform: rotate(180deg);
+}
